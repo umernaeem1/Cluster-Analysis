@@ -1,0 +1,289 @@
+---
+title: "LSSO Data Analysis"
+author: "Umer Naeem"
+date: "6/7/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(factoextra)
+
+setwd("C:/Users/lenovo/Dropbox/A5040 informality and social security study_Laos/analysis/LSSO/LSSO's Statistics to ILO/")
+
+contribs <- readxl::read_xls("./contribs.xls")
+employee <- readxl::read_xlsx("./employee.xlsx")
+```
+
+```{r}
+contribs <- employee %>%
+  select(ssnum, birthdate) %>%
+  distinct(ssnum, .keep_all = TRUE) %>%
+  right_join(contribs, by="ssnum") %>%
+  rowwise() %>%
+  mutate(age = eeptools::age_calc(as.Date(birthdate), units = "years"))
+
+summary(contribs$age)
+# on average, the age is 46.43, while median is 49
+
+new <- contribs %>%
+  group_by(ssnum) %>%
+  mutate(total_months = n(),
+         total_informal = sum(emprcode=="00000"),
+         informality_prop = total_informal/total_months,
+         formal = ifelse(informality_prop==1, "Totally Informal",
+                         ifelse(informality_prop==0,"Formal","Partially Formal"))) %>%
+  select(ssnum, age, total_months, total_informal, informality_prop, formal) %>%
+  distinct(ssnum, .keep_all = TRUE) %>%
+  arrange(desc(age))
+
+new %>%
+  group_by(formal) %>%
+  summarise(n=n()) %>%
+  mutate(prop = n/sum(n))
+
+ggplot(new, aes(x=age, y=total_months, shape=formal, color=formal)) +
+  geom_point()
+  
+ggplot(new, aes(x=age, y=total_months, shape=formal, color=formal)) +
+  geom_point() + 
+  theme_classic() +
+  scale_color_grey()
+
+
+writexl::write_xlsx(new, "./Age_wise.xlsx")
+```
+
+
+# Making variables
+
+If the emprcode is 00000, then the person was working as a voluntary worker
+
+## 1) The number of jobs in the formal sector over 96 months
+
+```{r}
+formal_jobs <- contribs %>%
+  distinct(ssnum, emprcode, .keep_all = TRUE) %>%
+  group_by(ssnum) %>%
+  summarise(jobs_f = sum(emprcode != "00000"))
+```
+
+## 2) Job tenure
+
+```{r}
+job_tenure <- contribs %>%
+  mutate(month_n = as.Date(as.yearmon(as.character(month),"%Y%m"))) %>%
+  group_by(ssnum, emprcode) %>%
+  mutate(tenure = last(month_n) - first(month_n)) %>%
+  select(emprcode, ssnum, tenure) %>%
+  ungroup() %>%
+  distinct(ssnum, emprcode, .keep_all = TRUE) %>%
+  select(ssnum, tenure)
+```
+
+## 3) the number of times an employee exited and returned to the formal sector
+
+```{r}
+entry_exit_f <- contribs %>%
+  group_by(ssnum, emprcode) %>%
+  filter(month == first(month)) %>%
+  select(ssnum, emprcode, month) %>%
+  group_by(ssnum) %>%
+  mutate(total = n()) %>%
+  arrange(ssnum, month) %>%
+  group_by(ssnum) %>%
+  mutate(
+    number_entry_exit = case_when(
+      emprcode=="00000" & total==1 ~ 0,
+      emprcode!="00000" & total==1 ~ 1,
+      total==2 ~ 1,
+      total==3 ~ 2
+    )
+  ) %>%
+  distinct(ssnum, .keep_all = TRUE) %>%
+  select(ssnum, number_entry_exit)
+```
+
+## 4) out-of-formal sector duration; 
+
+```{r}
+out_formal_duration <- contribs %>%
+  select(ssnum, emprcode, month) %>%
+  mutate(month_n = as.Date(as.yearmon(as.character(month),"%Y%m"))) %>%
+  arrange(ssnum, month) %>%
+  filter(emprcode == "00000") %>%
+  group_by(ssnum) %>%
+  mutate(out_formal = last(month_n) - first(month_n)) %>%
+  distinct(ssnum, .keep_all = TRUE) %>%
+  select(ssnum, out_formal)
+```
+
+## 5) The number of times an employee returned to the same employer after leaving; and
+
+```{r}
+contribs %>%
+  select(ssnum, emprcode, month) %>%
+  group_by(ssnum, emprcode) %>%
+  filter(month == first(month)) %>%
+  group_by(ssnum) %>%
+  mutate(total = n()) %>%
+  arrange(ssnum, month) %>%
+  filter(total > 1 & emprcode != "00000") %>%
+  group_by(ssnum) %>%
+  mutate(total1 = n()) %>%
+  filter(total1 > 1)
+
+# We dont have any such employee who returned to same employer
+
+return_same_empr <- contribs %>%
+  distinct(ssnum) %>%
+  mutate(return_same_empr = 0)
+```
+
+## 6) The last month observed as being employed in the formal sector
+
+```{r}
+last_month_formal <- contribs %>%
+  select(ssnum, emprcode, month) %>%
+  arrange(ssnum, month) %>%
+  group_by(ssnum) %>%
+  filter(month == last(month)) %>%
+  mutate(
+    last_month_formal = ifelse(emprcode=="00000", 0, 1)
+  ) %>%
+  select(ssnum, last_month_formal)
+```
+
+# Combining everything
+
+```{r}
+combined_df <- formal_jobs %>%
+  full_join(job_tenure, by="ssnum") %>%
+  full_join(entry_exit_f, by="ssnum") %>%
+  full_join(out_formal_duration, by="ssnum") %>%
+  full_join(return_same_empr, by="ssnum") %>%
+  full_join(last_month_formal, by="ssnum")
+```
+
+# KMeans Cluster
+
+Some cleaning
+
+```{r}
+kmeans_df <- combined_df %>%
+  mutate(tenure = as.numeric(tenure),
+         out_formal = as.numeric(out_formal)) %>%
+  select(-ssnum, -return_same_empr)
+
+kmeans_df[is.na(kmeans_df)] <- 0
+
+lsso_labels <- combined_df$ssnum
+```
+
+Kmeans-prep
+
+```{r}
+# scaling
+kmeans_df_scale <- scale(kmeans_df)
+
+# Distance
+lsso_df <- dist(kmeans_df_scale)
+
+# Number of clusters
+fviz_nbclust(kmeans_df_scale, kmeans, method = "wss")
+```
+
+
+Kmeans
+
+```{r}
+km_out <- kmeans(kmeans_df_scale, centers = 3, nstart = 100)
+
+km_out
+```
+
+kmeans-visualization
+
+```{r}
+km_cluster <- km_out$cluster
+
+fviz_cluster(list(data=kmeans_df_scale, cluster = km_cluster))
+```
+
+
+# Analysis
+
+```{r}
+cluster_df <- data.frame(
+  ssnum = lsso_labels,
+  cluster_id = km_cluster
+)
+
+combined_df2 <- combined_df %>%
+  inner_join(cluster_df, by="ssnum")
+
+tapply(combined_df2$jobs_f, combined_df2$cluster_id, summary)
+```
+
+
+```{r}
+contribs %>%
+  select(ssnum, emprcode) %>%
+  distinct(ssnum, emprcode) %>%
+  group_by(ssnum) %>%
+  mutate(total = n()) %>%
+  mutate(informal = ifelse(total==1 & emprcode=="00000", "yes", "no")) %>%
+  group_by(informal) %>%
+  summarise(total = n())
+```
+
+```{r}
+clust1 <- combined_df2[which(combined_df2$cluster_id==1),]
+clust2 <- combined_df2[which(combined_df2$cluster_id==2),]
+clust3 <- combined_df2[which(combined_df2$cluster_id==3),]
+
+# Jobs in formal
+quantile(clust1$jobs_f, c(.25,.5,.75))
+quantile(clust2$jobs_f, c(.25,.5,.75))
+quantile(clust3$jobs_f, c(.25,.5,.75))
+
+# Job tenure
+quantile(clust1$tenure, c(.25,.5,.75))
+quantile(clust2$tenure, c(.25,.5,.75))
+quantile(clust3$tenure, c(.25,.5,.75))
+
+# exit formal
+quantile(clust1$number_entry_exit, c(.25,.5,.75))
+quantile(clust2$number_entry_exit, c(.25,.5,.75))
+quantile(clust3$number_entry_exit, c(.25,.5,.75))
+
+# out of formal
+quantile(clust1$out_formal, c(.25,.5,.75))
+quantile(clust2$out_formal, c(.25,.5,.75))
+quantile(clust3$out_formal, c(.25,.5,.75), na.rm = TRUE)
+
+# last month in formal
+quantile(clust1$last_month_formal, c(.25,.5,.75))
+quantile(clust2$last_month_formal, c(.25,.5,.75))
+quantile(clust3$last_month_formal, c(.25,.5,.75))
+
+combined_df2 %>%
+  group_by(cluster_id) %>%
+  summarise(avg = mean(jobs_f))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
